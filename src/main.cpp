@@ -47,21 +47,24 @@ void sendFluidLevel() {
     }
 }
 
+void nmeaTask(void* pvParameters) {
+    ESP_LOGI(TAG, "NMEA task started");
+    setupNMEA2000();
+    while (1) {
+        sendFluidLevel();
+        NMEA2000.ParseMessages();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void webServerTask(void* pvParameters) {
     ESP_LOGI(TAG, "Web server task started");
-    // Pause TWAI before WiFi init
-    twai_stop();
-    ESP_LOGI(TAG, "TWAI paused for WiFi startup");
-    
+    twai_driver_uninstall();  // Fully remove TWAI
+    ESP_LOGI(TAG, "TWAI uninstalled for WiFi/HTTP startup");
     webServer.start();
-
-    // Restart TWAI after WiFi/HTTP is up
-    if (twai_start() == ESP_OK) {
-        ESP_LOGI(TAG, "TWAI restarted after WiFi startup");
-    } else {
-        ESP_LOGE(TAG, "Failed to restart TWAI");
-    }
-    
+    ESP_LOGI(TAG, "Web server startup completed");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 5, NULL);
     vTaskDelete(NULL);
 }
 
@@ -75,16 +78,12 @@ extern "C" void app_main() {
     }
     ESP_LOGI(TAG, "NVS initialized");
 
-    setupNMEA2000();
-    vTaskDelay(pdMS_TO_TICKS(2000));  // 2-second delay
-
+    vTaskDelay(pdMS_TO_TICKS(2000));
     ESP_LOGI(TAG, "Starting web server task...");
-    xTaskCreate(webServerTask, "web_server_task", 8192, NULL, 5, NULL);
+    xTaskCreate(webServerTask, "web_server_task", 16384, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Entering main loop...");
     while (1) {
-        sendFluidLevel();
-        NMEA2000.ParseMessages();
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
