@@ -62,7 +62,7 @@ void webServerTask(void* pvParameters) {
     webServer.start();
     ESP_LOGI(TAG, "Web server startup completed");
     vTaskDelay(pdMS_TO_TICKS(5000));
-    xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 5, NULL);
+    //xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 5, NULL);
     vTaskDelete(NULL);
 }
 
