@@ -20,6 +20,7 @@ N2kCanDriver::N2kCanDriver(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t rs_p
         _device_name = "Ultrasonic Level Sensor";
         _transmission_interval_ms = 1000;
     }
+    // No TWAI init here—moved to Init()
 }
 
 void N2kCanDriver::Init() {

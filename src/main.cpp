@@ -25,7 +25,7 @@ void setupNMEA2000() {
     NMEA2000.SetMsgHandler([](const tN2kMsg& msg) {
         ESP_LOGI(TAG, "Received PGN: %lu", msg.PGN);
     });
-    NMEA2000.Init();  // Use manual init
+    NMEA2000.Init();  // Manual TWAI init
     ESP_LOGI(TAG, "NMEA2000 initialized");
 }
 
