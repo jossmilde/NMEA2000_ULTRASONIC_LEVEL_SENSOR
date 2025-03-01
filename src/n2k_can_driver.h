@@ -12,6 +12,7 @@ public:
                  gpio_num_t rx_pin = GPIO_NUM_26, 
                  gpio_num_t rs_pin = GPIO_NUM_23);
     virtual ~N2kCanDriver();
+    void Init();  // New manual init method
 
     void setDeviceName(const std::string& name);
     std::string getDeviceName() const;

@@ -25,7 +25,7 @@ void setupNMEA2000() {
     NMEA2000.SetMsgHandler([](const tN2kMsg& msg) {
         ESP_LOGI(TAG, "Received PGN: %lu", msg.PGN);
     });
-    NMEA2000.Open();
+    NMEA2000.Init();  // Manual TWAI init
     ESP_LOGI(TAG, "NMEA2000 initialized");
 }
 
@@ -59,11 +59,9 @@ void nmeaTask(void* pvParameters) {
 
 void webServerTask(void* pvParameters) {
     ESP_LOGI(TAG, "Web server task started");
-    twai_driver_uninstall();  // Fully remove TWAI
-    ESP_LOGI(TAG, "TWAI uninstalled for WiFi/HTTP startup");
     webServer.start();
     ESP_LOGI(TAG, "Web server startup completed");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(5000));  // Extended delay
     xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 5, NULL);
     vTaskDelete(NULL);
 }
