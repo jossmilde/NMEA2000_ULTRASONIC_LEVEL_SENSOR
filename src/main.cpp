@@ -25,7 +25,7 @@ void setupNMEA2000() {
     NMEA2000.SetMsgHandler([](const tN2kMsg& msg) {
         ESP_LOGI(TAG, "Received PGN: %lu", msg.PGN);
     });
-    NMEA2000.Init();  // Manual TWAI init
+    NMEA2000.Init();  // Use manual init
     ESP_LOGI(TAG, "NMEA2000 initialized");
 }
 
@@ -61,7 +61,7 @@ void webServerTask(void* pvParameters) {
     ESP_LOGI(TAG, "Web server task started");
     webServer.start();
     ESP_LOGI(TAG, "Web server startup completed");
-    vTaskDelay(pdMS_TO_TICKS(5000));  // Extended delay
+    vTaskDelay(pdMS_TO_TICKS(5000));
     xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 5, NULL);
     vTaskDelete(NULL);
 }
