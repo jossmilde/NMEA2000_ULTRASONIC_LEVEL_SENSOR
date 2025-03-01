@@ -121,4 +121,4 @@ bool N2kCanDriver::CANGetFrame(unsigned long& id, unsigned char& len, unsigned c
         }
     }
     return false;
-}
+}//last known n2k_can_driver.cpp

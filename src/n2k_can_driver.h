@@ -33,4 +33,4 @@ private:
     uint32_t _transmission_interval_ms;
 };
 
-#endif
+#endif//last known n2k_can_driver.h
