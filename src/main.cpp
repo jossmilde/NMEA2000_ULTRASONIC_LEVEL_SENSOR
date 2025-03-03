@@ -9,7 +9,8 @@
 #include <esp_wifi.h>
 #include <esp_netif.h>
 #include <esp_event.h>
-//test
+#include <inttypes.h>  // For PRIu32
+
 static const char* TAG = "Main";
 
 N2kCanDriver NMEA2000(GPIO_NUM_27, GPIO_NUM_26, GPIO_NUM_23);
@@ -91,10 +92,14 @@ void wifiScanTask(void* pvParameters) {
     while (retries--) {
         wifi_scan_config_t scan_config = {};
         scan_config.ssid = nullptr;  // Scan all SSIDs
-        scan_config.channel = 0;
+        scan_config.channel = 6;     // Target Channel 6 (LieMo_Gast)
+        scan_config.scan_time.active.min = 4000;  // Min scan time (4s)
+        scan_config.scan_time.active.max = 6000;  // Max scan time (6s)
+        ESP_LOGI(TAG, "Starting WiFi scan on Channel 6 with min=%" PRIu32 " ms, max=%" PRIu32 " ms", 
+                 scan_config.scan_time.active.min, scan_config.scan_time.active.max);
         esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "WiFi scan failed with error %d, retries left: %d", ret, retries);
+            ESP_LOGE(TAG, "WiFi scan failed on Channel 6 with error %d, retries left: %d", ret, retries);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
@@ -105,9 +110,20 @@ void wifiScanTask(void* pvParameters) {
         ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
         bool found = false;
         for (int i = 0; i < ap_count; i++) {
-            ESP_LOGI(TAG, "Scanned AP: SSID=%s, RSSI=%d, Channel=%d", ap_list[i].ssid, ap_list[i].rssi, ap_list[i].primary);
+            const char* auth_mode;
+            switch (ap_list[i].authmode) {
+                case WIFI_AUTH_OPEN: auth_mode = "OPEN"; break;
+                case WIFI_AUTH_WEP: auth_mode = "WEP"; break;
+                case WIFI_AUTH_WPA_PSK: auth_mode = "WPA_PSK"; break;
+                case WIFI_AUTH_WPA2_PSK: auth_mode = "WPA2_PSK"; break;
+                case WIFI_AUTH_WPA_WPA2_PSK: auth_mode = "WPA_WPA2_PSK"; break;
+                default: auth_mode = "UNKNOWN"; break;
+            }
+            ESP_LOGI(TAG, "Scanned AP: SSID=%s, RSSI=%d, Channel=%d, Auth=%s", 
+                     ap_list[i].ssid, ap_list[i].rssi, ap_list[i].primary, auth_mode);
             if (strcmp((char*)ap_list[i].ssid, stored_ssid.c_str()) == 0) {
-                ESP_LOGI(TAG, "Found stored SSID %s (RSSI: %d, Channel: %d), switching to STA mode", stored_ssid.c_str(), ap_list[i].rssi, ap_list[i].primary);
+                ESP_LOGI(TAG, "Found stored SSID %s (RSSI: %d, Channel: %d), switching to STA mode", 
+                         stored_ssid.c_str(), ap_list[i].rssi, ap_list[i].primary);
                 found = true;
                 break;
             }
@@ -143,21 +159,56 @@ void webServerTask(void* pvParameters) {
         ESP_LOGI(TAG, "Found WiFi credentials in NVM: SSID=%s, Password=%s", ssid.c_str(), password.c_str());
         esp_netif_create_default_wifi_sta();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80));  // 20 dBm (100 mW), European max
 
-        wifi_scan_config_t scan_config = {};
-        scan_config.ssid = nullptr;
-        esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
+        // Targeted scan on Channel 6 first
+        int init_retries = 3;
+        esp_err_t ret;
+        while (init_retries--) {
+            wifi_scan_config_t scan_config = {};
+            scan_config.ssid = nullptr;  // Scan all SSIDs
+            scan_config.channel = 6;     // Target Channel 6 (LieMo_Gast)
+            scan_config.scan_time.active.min = 4000;  // Min scan time (4s)
+            scan_config.scan_time.active.max = 6000;  // Max scan time (6s)
+            ESP_LOGI(TAG, "Starting initial WiFi scan on Channel 6 with min=%" PRIu32 " ms, max=%" PRIu32 " ms", 
+                     scan_config.scan_time.active.min, scan_config.scan_time.active.max);
+            ret = esp_wifi_scan_start(&scan_config, true);
+            if (ret == ESP_OK) break;
+            ESP_LOGE(TAG, "Initial WiFi scan failed on Channel 6: %d, retries left: %d", ret, init_retries);
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
         if (ret == ESP_OK) {
             uint16_t ap_count = 0;
             esp_wifi_scan_get_ap_num(&ap_count);
             wifi_ap_record_t* ap_list = (wifi_ap_record_t*)malloc(ap_count * sizeof(wifi_ap_record_t));
             ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+            bool found = false;
             for (int i = 0; i < ap_count; i++) {
-                ESP_LOGI(TAG, "Initial scan: SSID=%s, RSSI=%d, Channel=%d", ap_list[i].ssid, ap_list[i].rssi, ap_list[i].primary);
+                const char* auth_mode;
+                switch (ap_list[i].authmode) {
+                    case WIFI_AUTH_OPEN: auth_mode = "OPEN"; break;
+                    case WIFI_AUTH_WEP: auth_mode = "WEP"; break;
+                    case WIFI_AUTH_WPA_PSK: auth_mode = "WPA_PSK"; break;
+                    case WIFI_AUTH_WPA2_PSK: auth_mode = "WPA2_PSK"; break;
+                    case WIFI_AUTH_WPA_WPA2_PSK: auth_mode = "WPA_WPA2_PSK"; break;
+                    default: auth_mode = "UNKNOWN"; break;
+                }
+                ESP_LOGI(TAG, "Initial scan: SSID=%s, RSSI=%d, Channel=%d, Auth=%s", 
+                         ap_list[i].ssid, ap_list[i].rssi, ap_list[i].primary, auth_mode);
+                if (strcmp((char*)ap_list[i].ssid, ssid.c_str()) == 0) {
+                    found = true;
+                    break;
+                }
             }
             free(ap_list);
+            if (found) {
+                esp_wifi_stop();  // Stop any AP mode
+            }
         } else {
-            ESP_LOGE(TAG, "Initial WiFi scan failed: %d", ret);
+            ESP_LOGE(TAG, "Initial WiFi scan failed after retries: %d", ret);
         }
 
         webServer.connectToWiFi(ssid.c_str(), password.c_str());
@@ -167,16 +218,17 @@ void webServerTask(void* pvParameters) {
             wifi_ap_record_t ap_info;
             esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
             if (ret == ESP_OK) {
-                ESP_LOGI(TAG, "Connected to WiFi STA successfully: SSID=%s, RSSI=%d, Channel=%d", ap_info.ssid, ap_info.rssi, ap_info.primary);
+                ESP_LOGI(TAG, "Connected to WiFi STA successfully: SSID=%s, RSSI=%d, Channel=%d", 
+                         ap_info.ssid, ap_info.rssi, ap_info.primary);
                 goto start_server;
             } else if (ret == ESP_ERR_WIFI_NOT_CONNECT) {
-                ESP_LOGI(TAG, "Still connecting to STA, retrying... (%d retries left)", retries);
+                ESP_LOGI(TAG, "Still connecting to STA %s, retrying... (%d retries left)", ssid.c_str(), retries);
             } else {
                 ESP_LOGE(TAG, "Failed to get STA info: %d", ret);
             }
             vTaskDelay(pdMS_TO_TICKS(500));
         }
-        ESP_LOGW(TAG, "Failed to connect to STA after %d retries, falling back to AP mode", 40);
+        ESP_LOGW(TAG, "Failed to connect to STA %s after 40 retries, falling back to AP mode", ssid.c_str());
         esp_wifi_stop();
         esp_wifi_deinit();
         esp_netif_create_default_wifi_ap();

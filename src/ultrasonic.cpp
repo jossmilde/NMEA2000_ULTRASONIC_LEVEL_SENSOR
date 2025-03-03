@@ -3,7 +3,7 @@
 #include <algorithm>
 #include "calibration.h"
 
-static const char* TAG = "Ultrasonic";
+//static const char* TAG = "Ultrasonic";
 
 Ultrasonic::Ultrasonic() : simulatedDistance(100.0) {
     calibrationPoints.push_back({20.0, 100.0});

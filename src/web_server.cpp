@@ -163,21 +163,21 @@ static esp_err_t tankFormHandler(httpd_req_t* req) {
     resp += "Height: <input type='text' name='tank_height' value='" + formatNumber(convertDistance(server->tank_height, "cm", server->dist_unit)) + "' id='tank_height'><br>";
     resp += "Offset: <input type='text' name='sensor_offset' value='" + formatNumber(convertDistance(server->sensor_offset, "cm", server->dist_unit)) + "' id='sensor_offset'><br>";
     resp += "Distance Unit: <select name='dist_unit' id='dist_unit' onchange='updateUnits(this.value)'>";
-    for (const std::string& unit : {"mm", "cm", "m", "inches", "ft"}) {
-        resp += "<option value='" + unit + "' " + (server->dist_unit == unit ? "selected" : "") + ">" + unit + "</option>";
+    for (const char* unit : {"mm", "cm", "m", "inches", "ft"}) {
+        resp += "<option value='" + std::string(unit) + "' " + (server->dist_unit == unit ? "selected" : "") + ">" + unit + "</option>";
     }
     resp += "</select><br>";
     resp += "Volume: <input type='text' name='tank_volume' value='" + formatNumber(convertVolume(server->tank_volume, "liter", server->getVolUnit())) + "' id='tank_volume'><br>";
     resp += "Volume Unit: <select name='vol_unit' id='vol_unit' onchange='updateVolumeUnit(this.value)'>";
-    for (const std::string& unit : {"liter", "m³", "gallon", "imperial gallon"}) {
-        resp += "<option value='" + unit + "' " + (server->vol_unit == unit ? "selected" : "") + ">" + unit + "</option>";
+    for (const char* unit : {"liter", "m³", "gallon", "imperial gallon"}) {
+        resp += "<option value='" + std::string(unit) + "' " + (server->vol_unit == unit ? "selected" : "") + ">" + unit + "</option>";
     }
     resp += "</select><br>";
     resp += "Low Alarm (%): <input type='text' name='low_alarm_percent' value='" + formatNumber(server->low_alarm_percent) + "'>%<br>";
     resp += "High Alarm (%): <input type='text' name='high_alarm_percent' value='" + formatNumber(server->high_alarm_percent) + "'>%<br>";
     resp += "Shape: <select name='tank_shape'>";
-    for (const std::string& shape : {"rectangular", "cylindrical standing", "cylindrical laying flat", "custom"}) {
-        resp += "<option value='" + shape + "' " + (server->tank_shape == shape ? "selected" : "") + ">" + shape + "</option>";
+    for (const char* shape : {"rectangular", "cylindrical standing", "cylindrical laying flat", "custom"}) {
+        resp += "<option value='" + std::string(shape) + "' " + (server->tank_shape == shape ? "selected" : "") + ">" + shape + "</option>";
     }
     resp += "</select><br>";
     resp += "<input type='submit' value='Save'></form>";
