@@ -9,7 +9,7 @@
 #include <esp_wifi.h>
 #include <esp_netif.h>
 #include <esp_event.h>
-#include <inttypes.h>  // For PRIu32
+#include <inttypes.h>
 
 static const char* TAG = "Main";
 
@@ -19,6 +19,30 @@ WebServer webServer(&NMEA2000, &sensor);
 
 const unsigned long DeviceSerial = 123456;
 const unsigned short ProductCode = 2001;
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "WiFi STA started");
+                esp_wifi_connect();
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                ESP_LOGE(TAG, "WiFi STA disconnected, reason: %d", ((wifi_event_sta_disconnected_t*)event_data)->reason);
+                break;
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "WiFi STA connected");
+                break;
+            default:
+                ESP_LOGI(TAG, "WiFi event: %ld", event_id);
+                break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
 
 void setupNMEA2000() {
     ESP_LOGI(TAG, "Setting up NMEA2000...");
@@ -152,6 +176,10 @@ void webServerTask(void* pvParameters) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // Register WiFi event handler
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     std::string ssid, password;
     webServer.loadWiFiConfig(ssid, password);
@@ -159,58 +187,9 @@ void webServerTask(void* pvParameters) {
         ESP_LOGI(TAG, "Found WiFi credentials in NVM: SSID=%s, Password=%s", ssid.c_str(), password.c_str());
         esp_netif_create_default_wifi_sta();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-        ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80));  // 20 dBm (100 mW), European max
 
-        // Targeted scan on Channel 6 first
-        int init_retries = 3;
-        esp_err_t ret;
-        while (init_retries--) {
-            wifi_scan_config_t scan_config = {};
-            scan_config.ssid = nullptr;  // Scan all SSIDs
-            scan_config.channel = 6;     // Target Channel 6 (LieMo_Gast)
-            scan_config.scan_time.active.min = 4000;  // Min scan time (4s)
-            scan_config.scan_time.active.max = 6000;  // Max scan time (6s)
-            ESP_LOGI(TAG, "Starting initial WiFi scan on Channel 6 with min=%" PRIu32 " ms, max=%" PRIu32 " ms", 
-                     scan_config.scan_time.active.min, scan_config.scan_time.active.max);
-            ret = esp_wifi_scan_start(&scan_config, true);
-            if (ret == ESP_OK) break;
-            ESP_LOGE(TAG, "Initial WiFi scan failed on Channel 6: %d, retries left: %d", ret, init_retries);
-            esp_wifi_stop();
-            esp_wifi_deinit();
-            ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-            vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-        if (ret == ESP_OK) {
-            uint16_t ap_count = 0;
-            esp_wifi_scan_get_ap_num(&ap_count);
-            wifi_ap_record_t* ap_list = (wifi_ap_record_t*)malloc(ap_count * sizeof(wifi_ap_record_t));
-            ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
-            bool found = false;
-            for (int i = 0; i < ap_count; i++) {
-                const char* auth_mode;
-                switch (ap_list[i].authmode) {
-                    case WIFI_AUTH_OPEN: auth_mode = "OPEN"; break;
-                    case WIFI_AUTH_WEP: auth_mode = "WEP"; break;
-                    case WIFI_AUTH_WPA_PSK: auth_mode = "WPA_PSK"; break;
-                    case WIFI_AUTH_WPA2_PSK: auth_mode = "WPA2_PSK"; break;
-                    case WIFI_AUTH_WPA_WPA2_PSK: auth_mode = "WPA_WPA2_PSK"; break;
-                    default: auth_mode = "UNKNOWN"; break;
-                }
-                ESP_LOGI(TAG, "Initial scan: SSID=%s, RSSI=%d, Channel=%d, Auth=%s", 
-                         ap_list[i].ssid, ap_list[i].rssi, ap_list[i].primary, auth_mode);
-                if (strcmp((char*)ap_list[i].ssid, ssid.c_str()) == 0) {
-                    found = true;
-                    break;
-                }
-            }
-            free(ap_list);
-            if (found) {
-                esp_wifi_stop();  // Stop any AP mode
-            }
-        } else {
-            ESP_LOGE(TAG, "Initial WiFi scan failed after retries: %d", ret);
-        }
-
+        // Direct connection to LieMo_Gast on Channel 6
+        ESP_LOGI(TAG, "Attempting direct connection to %s on Channel 6", ssid.c_str());
         webServer.connectToWiFi(ssid.c_str(), password.c_str());
 
         int retries = 40;
@@ -279,4 +258,4 @@ extern "C" void app_main() {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-}//last known version
+}

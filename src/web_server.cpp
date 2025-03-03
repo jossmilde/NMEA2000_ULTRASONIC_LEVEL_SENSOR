@@ -430,7 +430,7 @@ void WebServer::startWiFiAP() {
     wifi_config_t wifi_config = {};
     strcpy((char*)wifi_config.ap.ssid, "NMEA2000_Sensor");
     wifi_config.ap.ssid_len = strlen("NMEA2000_Sensor");
-    wifi_config.ap.channel = 1;
+    wifi_config.ap.channel = 11;  // Move to Channel 11 to avoid overlap with Channel 6
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
 
@@ -440,7 +440,7 @@ void WebServer::startWiFiAP() {
     if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set AP config: %d", ret);
     ret = esp_wifi_start();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to start WiFi AP: %d", ret);
-    ESP_LOGI(TAG, "WiFi AP started");
+    ESP_LOGI(TAG, "WiFi AP started on Channel 11");
 }
 
 void WebServer::connectToWiFi(const char* ssid, const char* password) {
@@ -450,8 +450,8 @@ void WebServer::connectToWiFi(const char* ssid, const char* password) {
     strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
     wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid) - 1] = '\0';
     wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = '\0';
-    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    wifi_config.sta.channel = 0;
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;  // Still scan all channels if needed
+    wifi_config.sta.channel = 6;  // Force Channel 6 for LieMo_Gast
 
     esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
     if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set STA mode: %d", ret);
@@ -459,7 +459,8 @@ void WebServer::connectToWiFi(const char* ssid, const char* password) {
     if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set STA config: %d", ret);
     ret = esp_wifi_start();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to start WiFi STA: %d", ret);
-    ESP_LOGI(TAG, "WiFi STA started, attempting connection...");
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80));  // 20 dBm, set after start
+    ESP_LOGI(TAG, "WiFi STA started, attempting connection on Channel 6...");
 
     nvs_handle_t nvs;
     ret = nvs_open("wifi_config", NVS_READWRITE, &nvs);
