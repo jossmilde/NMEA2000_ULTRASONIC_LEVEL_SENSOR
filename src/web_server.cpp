@@ -1,172 +1,742 @@
 #include "web_server.h"
+#include <esp_log.h>
+#include <esp_http_server.h>
+#include <esp_wifi.h>
 #include <nvs_flash.h>
-#include <string.h>
 #include <string>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include "N2kMessages.h"
+#include "calibration.h"
+#include "ultrasonic.h"
 
 static const char* TAG = "WebServer";
 
-WebServer::WebServer(N2kCanDriver* nmea) : _server(nullptr), _nmea(nmea) {
-    ESP_LOGI(TAG, "WebServer constructor called");
-    loadCalibrationFromNVS();
+WebServer::WebServer(N2kCanDriver* nmea2000, Ultrasonic* sensor) : _nmea2000(nmea2000), _sensor(sensor), _server(NULL) {
+    config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 4;
+    config.stack_size = 24576;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
 }
 
 WebServer::~WebServer() {
-    ESP_LOGI(TAG, "WebServer destructor called");
-    if (_server) httpd_stop(_server);
+    if (_server) {
+        httpd_stop(_server);
+        _server = NULL;
+    }
+}
+
+static float convertDistance(float value, const std::string& from_unit, const std::string& to_unit) {
+    if (from_unit == to_unit) return value;
+    float cm_value = value;
+    if (from_unit == "mm") cm_value = value / 10.0;
+    else if (from_unit == "m") cm_value = value * 100.0;
+    else if (from_unit == "inches") cm_value = value * 2.54;
+    else if (from_unit == "ft") cm_value = value * 30.48;
+
+    if (to_unit == "mm") return cm_value * 10.0;
+    else if (to_unit == "m") return cm_value / 100.0;
+    else if (to_unit == "inches") return cm_value / 2.54;
+    else if (to_unit == "ft") return cm_value / 30.48;
+    return cm_value;
+}
+
+static float convertVolume(float value, const std::string& from_unit, const std::string& to_unit) {
+    if (from_unit == to_unit) return value;
+    float liter_value = value;
+    if (from_unit == "gallon") liter_value = value * 3.78541;
+    else if (from_unit == "imperial gallon") liter_value = value * 4.54609;
+    else if (from_unit == "m³") liter_value = value * 1000.0;
+
+    if (to_unit == "gallon") return liter_value / 3.78541;
+    else if (to_unit == "imperial gallon") return liter_value / 4.54609;
+    else if (to_unit == "m³") return liter_value / 1000.0;
+    return liter_value;
+}
+
+static std::string formatNumber(float value) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1) << value;
+    return oss.str();
+}
+
+static float parseFloat(const std::string& value, float default_value = 0.0) {
+    std::string cleaned = value;
+    std::replace(cleaned.begin(), cleaned.end(), ',', '.');
+    if (cleaned.empty() || cleaned.find_first_not_of(" \t\n") == std::string::npos) {
+        ESP_LOGW(TAG, "Empty or whitespace-only input '%s', returning default: %.1f", value.c_str(), default_value);
+        return default_value;
+    }
+
+    // Manually check if the string is a valid float
+    bool has_digit = false;
+    bool has_decimal = false;
+    for (char c : cleaned) {
+        if (std::isdigit(c)) {
+            has_digit = true;
+        } else if (c == '.' && !has_decimal) {
+            has_decimal = true;
+        } else if (c != '-' || (c == '-' && &c != &cleaned[0])) {  // Allow '-' only at start
+            ESP_LOGW(TAG, "Invalid float format '%s', returning default: %.1f", cleaned.c_str(), default_value);
+            return default_value;
+        }
+    }
+    if (!has_digit) {
+        ESP_LOGW(TAG, "No digits in '%s', returning default: %.1f", cleaned.c_str(), default_value);
+        return default_value;
+    }
+
+    size_t pos;
+    float result = std::stof(cleaned, &pos);
+    if (pos != cleaned.length()) {
+        ESP_LOGW(TAG, "Partial parse of '%s' to %.1f, trailing characters ignored", cleaned.c_str(), result);
+    }
+    return result;
+}
+
+static esp_err_t rootHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    float level_percent = server->getLevelPercentage();
+    float volume_liters = server->getTankVolumeLiters();
+
+    char uri_buf[512];
+    int uri_len = httpd_req_get_url_query_len(req);
+    if (uri_len > 0 && httpd_req_get_url_query_str(req, uri_buf, sizeof(uri_buf)) == ESP_OK) {
+        ESP_LOGI(TAG, "Root request URI: %s", uri_buf);
+    } else {
+        ESP_LOGI(TAG, "Root request URI: / (no query)");
+    }
+
+    std::string resp = "<html><body><h1>Level Sensor</h1>";
+    resp += "<p>Level: " + formatNumber(level_percent) + "%</p>";
+    resp += "<p>Volume: " + formatNumber(convertVolume(volume_liters, "liter", server->getVolUnit())) + " " + server->getVolUnit() + "</p>";
+    resp += "<p id='status' style='color:green;display:none'>Saved</p>";
+
+    resp += "<h2>Tank</h2>";
+    resp += "<p>Height: " + formatNumber(convertDistance(server->tank_height, "cm", server->dist_unit)) + " " + server->dist_unit + "</p>";
+    resp += "<p>Volume: " + formatNumber(convertVolume(server->tank_volume, "liter", server->getVolUnit())) + " " + server->getVolUnit() + "</p>";
+    resp += "<p>Offset: " + formatNumber(convertDistance(server->sensor_offset, "cm", server->dist_unit)) + " " + server->dist_unit + "</p>";
+    resp += "<p>Low Alarm: " + formatNumber(server->low_alarm_percent) + "% (" + formatNumber(convertVolume(server->getLowAlarmVolume(), "liter", server->getVolUnit())) + " " + server->getVolUnit() + ")</p>";
+    resp += "<p>High Alarm: " + formatNumber(server->high_alarm_percent) + "% (" + formatNumber(convertVolume(server->getHighAlarmVolume(), "liter", server->getVolUnit())) + " " + server->getVolUnit() + ")</p>";
+    resp += "<p>Shape: " + server->tank_shape + "</p>";
+    resp += "<form id='tankForm' onsubmit='saveTank(event)'><input type='submit' value='Edit Tank Settings'></form>";
+
+    resp += "<h2>Config</h2>";
+    resp += "<p>Interval: " + std::to_string(server->getTransmissionInterval()) + " ms</p>";
+    std::string device_name = server->getDeviceName();
+    std::replace(device_name.begin(), device_name.end(), '+', ' ');
+    resp += "<p>Name: " + device_name + "</p>";
+    resp += "<form id='configForm' onsubmit='saveConfig(event)'><input type='submit' value='Edit Config'></form>";
+
+    std::string ssid, password;
+    server->loadWiFiConfig(ssid, password);
+    resp += "<h2>WiFi</h2>";
+    resp += "<p>SSID: " + ssid + "</p>";
+    resp += "<form id='wifiForm' onsubmit='saveWifi(event)'><input type='submit' value='Edit WiFi'></form>";
+
+    resp += "<h2>System</h2><a href='/reboot'><button>Reboot</button></a>";
+
+    resp += "<script>";
+    resp += "function showStatus(){document.getElementById('status').style.display='block';setTimeout(function(){document.getElementById('status').style.display='none';},3000);}";
+    resp += "async function saveTank(e){e.preventDefault();const w=window.open('/tank_form','_blank','width=400,height=600');}";
+    resp += "async function saveConfig(e){e.preventDefault();const w=window.open('/config_form','_blank','width=400,height=400');}";
+    resp += "async function saveWifi(e){e.preventDefault();const w=window.open('/wifi_form','_blank','width=400,height=400');}";
+    resp += "</script>";
+
+    resp += "</body></html>";
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, resp.c_str(), resp.length());
+    ESP_LOGI(TAG, "Served root page, level: %.1f%%", level_percent);
+    return ESP_OK;
+}
+
+static esp_err_t tankFormHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    std::string resp = "<html><body><h1>Tank Settings</h1>";
+    resp += "<form id='tankForm' onsubmit='save(event, \"tank\")'>";
+    resp += "Height: <input type='text' name='tank_height' value='" + formatNumber(convertDistance(server->tank_height, "cm", server->dist_unit)) + "' id='tank_height'><br>";
+    resp += "Offset: <input type='text' name='sensor_offset' value='" + formatNumber(convertDistance(server->sensor_offset, "cm", server->dist_unit)) + "' id='sensor_offset'><br>";
+    resp += "Distance Unit: <select name='dist_unit' id='dist_unit' onchange='updateUnits(this.value)'>";
+    for (const std::string& unit : {"mm", "cm", "m", "inches", "ft"}) {
+        resp += "<option value='" + unit + "' " + (server->dist_unit == unit ? "selected" : "") + ">" + unit + "</option>";
+    }
+    resp += "</select><br>";
+    resp += "Volume: <input type='text' name='tank_volume' value='" + formatNumber(convertVolume(server->tank_volume, "liter", server->getVolUnit())) + "' id='tank_volume'><br>";
+    resp += "Volume Unit: <select name='vol_unit' id='vol_unit' onchange='updateVolumeUnit(this.value)'>";
+    for (const std::string& unit : {"liter", "m³", "gallon", "imperial gallon"}) {
+        resp += "<option value='" + unit + "' " + (server->vol_unit == unit ? "selected" : "") + ">" + unit + "</option>";
+    }
+    resp += "</select><br>";
+    resp += "Low Alarm (%): <input type='text' name='low_alarm_percent' value='" + formatNumber(server->low_alarm_percent) + "'>%<br>";
+    resp += "High Alarm (%): <input type='text' name='high_alarm_percent' value='" + formatNumber(server->high_alarm_percent) + "'>%<br>";
+    resp += "Shape: <select name='tank_shape'>";
+    for (const std::string& shape : {"rectangular", "cylindrical standing", "cylindrical laying flat", "custom"}) {
+        resp += "<option value='" + shape + "' " + (server->tank_shape == shape ? "selected" : "") + ">" + shape + "</option>";
+    }
+    resp += "</select><br>";
+    resp += "<input type='submit' value='Save'></form>";
+    resp += "<script>";
+    resp += "function updateUnits(newUnit){";
+    resp += "  var h=document.getElementById('tank_height'), o=document.getElementById('sensor_offset'), cm_h=" + std::to_string(server->tank_height) + ", cm_o=" + std::to_string(server->sensor_offset) + ";";
+    resp += "  h.value=(newUnit=='mm'?cm_h*10:(newUnit=='m'?cm_h/100:(newUnit=='inches'?cm_h/2.54:(newUnit=='ft'?cm_h/30.48:cm_h)))).toFixed(1);";
+    resp += "  o.value=(newUnit=='mm'?cm_o*10:(newUnit=='m'?cm_o/100:(newUnit=='inches'?cm_o/2.54:(newUnit=='ft'?cm_o/30.48:cm_o)))).toFixed(1);";
+    resp += "}";
+    resp += "function updateVolumeUnit(newUnit){";
+    resp += "  var v=document.getElementById('tank_volume'), liter=" + std::to_string(server->tank_volume) + ";";
+    resp += "  v.value=(newUnit=='m³'?liter/1000:(newUnit=='gallon'?liter/3.78541:(newUnit=='imperial gallon'?liter/4.54609:liter))).toFixed(1);";
+    resp += "}";
+    resp += "async function save(e,endpoint){";
+    resp += "  e.preventDefault();";
+    resp += "  const form=new FormData(e.target);";
+    resp += "  form.set('tank_height', document.getElementById('tank_height').value);";
+    resp += "  form.set('sensor_offset', document.getElementById('sensor_offset').value);";
+    resp += "  form.set('tank_volume', document.getElementById('tank_volume').value);";
+    resp += "  form.set('dist_unit', document.getElementById('dist_unit').value);";
+    resp += "  form.set('vol_unit', document.getElementById('vol_unit').value);";
+    resp += "  await fetch('/'+endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(form).toString()});";
+    resp += "  window.opener.location.reload();window.close();}";
+    resp += "</script>";
+    resp += "</body></html>";
+
+    httpd_resp_send(req, resp.c_str(), resp.length());
+    return ESP_OK;
+}
+
+static esp_err_t tankHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    char buf[2048];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+            ESP_LOGE(TAG, "Tank request timeout");
+        } else {
+            ESP_LOGE(TAG, "Tank request failed: %d", ret);
+        }
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    ESP_LOGI(TAG, "Tank request (POST) received, length=%d: %s", ret, buf);
+
+    char param[64];
+    float tank_height = server->tank_height;
+    float tank_volume = server->tank_volume;
+    float sensor_offset = server->sensor_offset;
+    float low_alarm_percent = server->low_alarm_percent;
+    float high_alarm_percent = server->high_alarm_percent;
+    std::string tank_shape = server->tank_shape;
+    std::string dist_unit = server->dist_unit;
+    std::string vol_unit = server->vol_unit;
+
+    if (httpd_query_key_value(buf, "dist_unit", param, sizeof(param)) == ESP_OK) {
+        dist_unit = param;
+        ESP_LOGI(TAG, "Parsed dist_unit: %s", dist_unit.c_str());
+    }
+    if (httpd_query_key_value(buf, "vol_unit", param, sizeof(param)) == ESP_OK) {
+        vol_unit = param;
+        ESP_LOGI(TAG, "Parsed vol_unit: %s", vol_unit.c_str());
+    }
+    if (httpd_query_key_value(buf, "tank_height", param, sizeof(param)) == ESP_OK) {
+        tank_height = convertDistance(parseFloat(param, server->tank_height), dist_unit, "cm");
+        ESP_LOGI(TAG, "Parsed tank_height: %.1f cm (from %s %s)", tank_height, param, dist_unit.c_str());
+    }
+    if (httpd_query_key_value(buf, "tank_volume", param, sizeof(param)) == ESP_OK) {
+        tank_volume = convertVolume(parseFloat(param, server->tank_volume), vol_unit, "liter");
+        ESP_LOGI(TAG, "Parsed tank_volume: %.1f liters (from %s %s)", tank_volume, param, vol_unit.c_str());
+    }
+    if (httpd_query_key_value(buf, "sensor_offset", param, sizeof(param)) == ESP_OK) {
+        sensor_offset = convertDistance(parseFloat(param, server->sensor_offset), dist_unit, "cm");
+        ESP_LOGI(TAG, "Parsed sensor_offset: %.1f cm (from %s %s)", sensor_offset, param, dist_unit.c_str());
+    }
+    if (httpd_query_key_value(buf, "low_alarm_percent", param, sizeof(param)) == ESP_OK) {
+        low_alarm_percent = parseFloat(param, server->low_alarm_percent);
+        if (low_alarm_percent > 100.0) low_alarm_percent = 100.0;
+        if (low_alarm_percent < 0.0) low_alarm_percent = 0.0;
+        ESP_LOGI(TAG, "Parsed low_alarm_percent: %.1f%%", low_alarm_percent);
+    }
+    if (httpd_query_key_value(buf, "high_alarm_percent", param, sizeof(param)) == ESP_OK) {
+        high_alarm_percent = parseFloat(param, server->high_alarm_percent);
+        if (high_alarm_percent > 100.0) high_alarm_percent = 100.0;
+        if (high_alarm_percent < 0.0) high_alarm_percent = 0.0;
+        ESP_LOGI(TAG, "Parsed high_alarm_percent: %.1f%%", high_alarm_percent);
+    }
+    if (httpd_query_key_value(buf, "tank_shape", param, sizeof(param)) == ESP_OK) {
+        tank_shape = param;
+        ESP_LOGI(TAG, "Parsed tank_shape: %s", tank_shape.c_str());
+    }
+
+    server->tank_height = tank_height;
+    server->tank_volume = tank_volume;
+    server->sensor_offset = sensor_offset;
+    server->low_alarm_percent = low_alarm_percent;
+    server->high_alarm_percent = high_alarm_percent;
+    server->tank_shape = tank_shape;
+    server->dist_unit = dist_unit;
+    server->vol_unit = vol_unit;
+    server->saveSettingsToNVS();
+
+    ESP_LOGI(TAG, "Tank settings saved successfully");
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t configFormHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    std::string resp = "<html><body><h1>Config</h1>";
+    resp += "<form id='configForm' onsubmit='save(event, \"config\")'>";
+    resp += "Interval (ms): <input type='number' name='interval' min='500' max='10000' value='" + std::to_string(server->getTransmissionInterval()) + "'><br>";
+    std::string device_name = server->getDeviceName();
+    std::replace(device_name.begin(), device_name.end(), '+', ' ');
+    resp += "Name: <input type='text' name='device_name' maxlength='31' value='" + device_name + "'><br>";
+    resp += "<input type='submit' value='Save'></form>";
+    resp += "<script>";
+    resp += "async function save(e,endpoint){e.preventDefault();const form=new FormData(e.target);";
+    resp += "await fetch('/'+endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(form).toString()});";
+    resp += "window.opener.location.reload();window.close();}";
+    resp += "</script>";
+    resp += "</body></html>";
+
+    httpd_resp_send(req, resp.c_str(), resp.length());
+    return ESP_OK;
+}
+
+static esp_err_t configHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    char buf[1024];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+        }
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    ESP_LOGI(TAG, "Config request (POST): %s", buf);
+
+    char param[32];
+    if (httpd_query_key_value(buf, "interval", param, sizeof(param)) == ESP_OK) {
+        uint32_t interval = std::stoi(param);
+        server->setTransmissionInterval(interval);
+    }
+    if (httpd_query_key_value(buf, "device_name", param, sizeof(param)) == ESP_OK) {
+        server->setDeviceName(param);
+    }
+
+    server->saveSettingsToNVS();
+
+    ESP_LOGI(TAG, "Config saved");
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t wifiFormHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    std::string ssid, password;
+    server->loadWiFiConfig(ssid, password);
+    std::string resp = "<html><body><h1>WiFi</h1>";
+    resp += "<form id='wifiForm' onsubmit='save(event, \"wifi\")'>";
+    resp += "SSID: <input type='text' name='ssid' maxlength='32' value='" + ssid + "'><br>";
+    resp += "Pass: <input type='text' name='password' maxlength='64' value='" + password + "'><br>";
+    resp += "<input type='submit' value='Save'></form>";
+    resp += "<script>";
+    resp += "async function save(e,endpoint){e.preventDefault();const form=new FormData(e.target);";
+    resp += "await fetch('/'+endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(form).toString()});";
+    resp += "window.opener.location.reload();window.close();}";
+    resp += "</script>";
+    resp += "</body></html>";
+
+    httpd_resp_send(req, resp.c_str(), resp.length());
+    return ESP_OK;
+}
+
+static esp_err_t wifiHandler(httpd_req_t* req) {
+    WebServer* server = static_cast<WebServer*>(req->user_ctx);
+    char buf[1024];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+        }
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    ESP_LOGI(TAG, "WiFi request (POST): %s", buf);
+
+    char ssid[33], password[65];
+    if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) == ESP_OK &&
+        httpd_query_key_value(buf, "password", password, sizeof(password)) == ESP_OK) {
+        server->connectToWiFi(ssid, password);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
+
+    ESP_LOGI(TAG, "WiFi STA config saved: SSID=%s", ssid);
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t rebootHandler(httpd_req_t* req) {
+    ESP_LOGI(TAG, "Reboot requested");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
 }
 
 void WebServer::start() {
-    ESP_LOGI(TAG, "Starting WiFi...");
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    if (esp_wifi_init(&cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize WiFi");
-        return;
-    }
-    if (esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set WiFi AP mode");
-        return;
-    }
-    wifi_config_t ap_config = {};
-    strcpy((char*)ap_config.ap.ssid, "NMEA2000_Sensor");
-    ap_config.ap.channel = 1;
-    ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    ap_config.ap.max_connection = 4;
-    if (esp_wifi_set_config(WIFI_IF_AP, &ap_config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure WiFi AP");
-        return;
-    }
-    if (esp_wifi_start() != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start WiFi");
-        return;
-    }
-    ESP_LOGI(TAG, "WiFi AP started");
-
     ESP_LOGI(TAG, "Starting HTTP server...");
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
-    config.stack_size = 8192;  // Increased stack size
-    if (httpd_start(&_server, &config) == ESP_OK) {
-        httpd_uri_t root = {
-            .uri = "/",
-            .method = HTTP_GET,
-            .handler = root_get_handler,
-            .user_ctx = this
-        };
-        httpd_register_uri_handler(_server, &root);
-
-        httpd_uri_t config_uri = {
-            .uri = "/config",
-            .method = HTTP_POST,
-            .handler = config_post_handler,
-            .user_ctx = this
-        };
-        httpd_register_uri_handler(_server, &config_uri);
-        ESP_LOGI(TAG, "Web server started");
+    wifi_mode_t mode;
+    esp_err_t wifi_status = esp_wifi_get_mode(&mode);
+    if (wifi_status == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi mode before httpd_start: %d", mode);
     } else {
-        ESP_LOGE(TAG, "Failed to start HTTP server");
+        ESP_LOGE(TAG, "Failed to get WiFi mode: %d", wifi_status);
     }
+
+    esp_err_t err = httpd_start(&_server, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server: %d", err);
+        return;
+    }
+
+    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = rootHandler, .user_ctx = this };
+    httpd_uri_t tank_form = { .uri = "/tank_form", .method = HTTP_GET, .handler = tankFormHandler, .user_ctx = this };
+    httpd_uri_t tank = { .uri = "/tank", .method = HTTP_POST, .handler = tankHandler, .user_ctx = this };
+    httpd_uri_t config_form = { .uri = "/config_form", .method = HTTP_GET, .handler = configFormHandler, .user_ctx = this };
+    httpd_uri_t config = { .uri = "/config", .method = HTTP_POST, .handler = configHandler, .user_ctx = this };
+    httpd_uri_t wifi_form = { .uri = "/wifi_form", .method = HTTP_GET, .handler = wifiFormHandler, .user_ctx = this };
+    httpd_uri_t wifi = { .uri = "/wifi", .method = HTTP_POST, .handler = wifiHandler, .user_ctx = this };
+    httpd_uri_t reboot = { .uri = "/reboot", .method = HTTP_GET, .handler = rebootHandler, .user_ctx = this };
+
+    httpd_register_uri_handler(_server, &root);
+    httpd_register_uri_handler(_server, &tank_form);
+    httpd_register_uri_handler(_server, &tank);
+    httpd_register_uri_handler(_server, &config_form);
+    httpd_register_uri_handler(_server, &config);
+    httpd_register_uri_handler(_server, &wifi_form);
+    httpd_register_uri_handler(_server, &wifi);
+    httpd_register_uri_handler(_server, &reboot);
+
+    ESP_LOGI(TAG, "HTTP server started");
 }
 
-std::vector<CalibrationPoint>& WebServer::getCalibrationPoints() {
-    return _calibration_points;
+void WebServer::startWiFiAP() {
+    ESP_LOGI(TAG, "Starting WiFi AP...");
+    wifi_config_t wifi_config = {};
+    strcpy((char*)wifi_config.ap.ssid, "NMEA2000_Sensor");
+    wifi_config.ap.ssid_len = strlen("NMEA2000_Sensor");
+    wifi_config.ap.channel = 1;
+    wifi_config.ap.max_connection = 4;
+    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set AP mode: %d", ret);
+    ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set AP config: %d", ret);
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to start WiFi AP: %d", ret);
+    ESP_LOGI(TAG, "WiFi AP started");
 }
 
-void WebServer::setCalibrationPoints(const std::vector<CalibrationPoint>& points) {
-    _calibration_points = points;
-    if (_calibration_points.size() > 16) _calibration_points.resize(16);
-    saveCalibrationToNVS();
-}
+void WebServer::connectToWiFi(const char* ssid, const char* password) {
+    ESP_LOGI(TAG, "Connecting to WiFi STA: SSID=%s, Password=%s", ssid, password);
+    wifi_config_t wifi_config = {};
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid) - 1] = '\0';
+    wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = '\0';
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_config.sta.channel = 0;
 
-void WebServer::loadCalibrationFromNVS() {
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set STA mode: %d", ret);
+    ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to set STA config: %d", ret);
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to start WiFi STA: %d", ret);
+    ESP_LOGI(TAG, "WiFi STA started, attempting connection...");
+
     nvs_handle_t nvs;
-    if (nvs_open("sensor_config", NVS_READWRITE, &nvs) == ESP_OK) {
-        uint8_t count = 0;
-        nvs_get_u8(nvs, "cal_count", &count);
-        _calibration_points.resize(count);
-        for (uint8_t i = 0; i < count; i++) {
-            char key[16];
-            uint32_t val;
-            snprintf(key, sizeof(key), "depth_%d", i);
-            if (nvs_get_u32(nvs, key, &val) == ESP_OK) _calibration_points[i].depth_cm = val / 100.0f;
-            snprintf(key, sizeof(key), "perc_%d", i);
-            if (nvs_get_u32(nvs, key, &val) == ESP_OK) _calibration_points[i].percentage = val / 100.0f;
+    ret = nvs_open("wifi_config", NVS_READWRITE, &nvs);
+    if (ret == ESP_OK) {
+        nvs_set_str(nvs, "ssid", ssid);
+        nvs_set_str(nvs, "password", password);
+        esp_err_t commit_ret = nvs_commit(nvs);
+        if (commit_ret == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi credentials committed to NVS");
+        } else {
+            ESP_LOGE(TAG, "Failed to commit WiFi credentials to NVS: %d", commit_ret);
         }
         nvs_close(nvs);
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for WiFi config: %d", ret);
     }
 }
 
-void WebServer::saveCalibrationToNVS() {
-    nvs_handle_t nvs;
-    if (nvs_open("sensor_config", NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_set_u8(nvs, "cal_count", _calibration_points.size());
-        for (size_t i = 0; i < _calibration_points.size(); i++) {
-            char key[16];
-            snprintf(key, sizeof(key), "depth_%d", i);
-            nvs_set_u32(nvs, key, (uint32_t)(_calibration_points[i].depth_cm * 100));
-            snprintf(key, sizeof(key), "perc_%d", i);
-            nvs_set_u32(nvs, key, (uint32_t)(_calibration_points[i].percentage * 100));
-        }
-        nvs_commit(nvs);
-        nvs_close(nvs);
-    }
-}
+float WebServer::getLevelPercentage() {
+    float raw_distance = _sensor->getLevelPercentage();
+    float distance = raw_distance - sensor_offset;
+    if (distance < 0) distance = 0;
+    float height = tank_height - sensor_offset;
+    if (height <= 0) return 100.0;
 
-esp_err_t WebServer::root_get_handler(httpd_req_t* req) {
-    WebServer* ws = (WebServer*)req->user_ctx;
-    std::string html = "<html><body><h1>Configure NMEA2000 Sensor</h1>"
-                       "<form action=\"/config\" method=\"post\">"
-                       "Device Name: <input type=\"text\" name=\"device_name\" value=\"" + ws->_nmea->getDeviceName() + "\"><br>"
-                       "Transmission Interval (ms): <input type=\"number\" name=\"tx_interval\" value=\"" + std::to_string(ws->_nmea->getTransmissionInterval()) + "\" min=\"500\" max=\"10000\"><br>"
-                       "<h2>Calibration Points (up to 16)</h2>";
-    for (size_t i = 0; i < 16; i++) {
-        std::string depth = i < ws->_calibration_points.size() ? std::to_string(ws->_calibration_points[i].depth_cm) : "";
-        std::string perc = i < ws->_calibration_points.size() ? std::to_string(ws->_calibration_points[i].percentage) : "";
-        html += "Point " + std::to_string(i + 1) + ": Depth (cm): <input type=\"number\" name=\"depth_" + std::to_string(i) + "\" value=\"" + depth + "\" step=\"0.1\"> "
-                "Percentage: <input type=\"number\" name=\"perc_" + std::to_string(i) + "\" value=\"" + perc + "\" step=\"0.1\"><br>";
-    }
-    html += "<input type=\"submit\" value=\"Save\"></form></body></html>";
-    httpd_resp_send(req, html.c_str(), HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
+    if (tank_shape == "rectangular" || tank_shape == "cylindrical standing") {
+        return 100.0 * (1.0 - distance / height);
+    } else if (tank_shape == "cylindrical laying flat") {
+        float h = distance / height;
+        float volume_percent = std::acos(1 - 2 * h) / M_PI + (2 * h - 1) * std::sqrt(2 * h - h * h) / M_PI;
+        return 100.0 * (1.0 - volume_percent);
+    } else {
+        std::vector<CalibrationPoint> calibration;
+        loadCalibrationFromNVS(calibration);
+        if (calibration.empty()) return 0.0;
+        if (distance <= calibration.front().distance) return calibration.front().percentage;
+        if (distance >= calibration.back().distance) return calibration.back().percentage;
 
-esp_err_t WebServer::config_post_handler(httpd_req_t* req) {
-    WebServer* ws = (WebServer*)req->user_ctx;
-    char buf[1024];
-    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (ret <= 0) return ESP_FAIL;
-    buf[ret] = '\0';
-
-    std::string device_name;
-    uint32_t tx_interval = 0;
-    std::vector<CalibrationPoint> points;
-    char* param = strtok(buf, "&");
-    while (param) {
-        char* value = strchr(param, '=');
-        if (value) {
-            *value++ = '\0';
-            if (strcmp(param, "device_name") == 0) device_name = value;
-            else if (strcmp(param, "tx_interval") == 0) tx_interval = atoi(value);
-            else if (strncmp(param, "depth_", 6) == 0) {
-                int idx = atoi(param + 6);
-                float depth = atof(value);
-                char perc_key[16];
-                snprintf(perc_key, sizeof(perc_key), "perc_%d", idx);
-                char* perc_param = strtok(NULL, "&");
-                if (perc_param && strncmp(perc_param, perc_key, strlen(perc_key)) == 0) {
-                    float perc = atof(strchr(perc_param, '=') + 1);
-                    if (depth > 0 && perc >= 0 && perc <= 100) {
-                        points.push_back({depth, perc});
-                    }
-                }
+        for (size_t i = 0; i < calibration.size() - 1; i++) {
+            if (distance >= calibration[i].distance && distance <= calibration[i + 1].distance) {
+                float d1 = calibration[i].distance;
+                float p1 = calibration[i].percentage;
+                float d2 = calibration[i + 1].distance;
+                float p2 = calibration[i + 1].percentage;
+                return p1 + (distance - d1) * (p2 - p1) / (d2 - d1);
             }
         }
-        param = strtok(NULL, "&");
+    }
+    return 0.0;
+}
+
+float WebServer::getTankVolumeLiters() {
+    float percent = getLevelPercentage() / 100.0;
+    return tank_volume * percent;
+}
+
+uint32_t WebServer::getTransmissionInterval() {
+    return _nmea2000->getTransmissionInterval();
+}
+
+std::string WebServer::getDeviceName() {
+    std::string name = _nmea2000->getDeviceName();
+    std::replace(name.begin(), name.end(), '+', ' ');
+    return name;
+}
+
+void WebServer::setTransmissionInterval(uint32_t interval) {
+    _nmea2000->setTransmissionInterval(interval);
+}
+
+void WebServer::setDeviceName(const std::string& name) {
+    _nmea2000->setDeviceName(name);
+}
+
+void WebServer::updateCalibration(const std::vector<CalibrationPoint>& calibration) {
+    _sensor->loadCalibrationFromNVS(calibration);
+}
+
+void WebServer::checkAndSendAlarms() {
+    float volume_liters = getTankVolumeLiters();
+    float low_alarm_liters = getLowAlarmVolume();
+    float high_alarm_liters = getHighAlarmVolume();
+    static bool low_alarm_active = false;
+    static bool high_alarm_active = false;
+
+    if (volume_liters <= low_alarm_liters && !low_alarm_active) {
+        ESP_LOGI(TAG, "Low fluid level alarm triggered: %.1f liters", volume_liters);
+        low_alarm_active = true;
+    } else if (volume_liters > low_alarm_liters && low_alarm_active) {
+        low_alarm_active = false;
     }
 
-    if (!device_name.empty()) ws->_nmea->setDeviceName(device_name);
-    if (tx_interval >= 500 && tx_interval <= 10000) ws->_nmea->setTransmissionInterval(tx_interval);
-    ws->setCalibrationPoints(points);
+    if (volume_liters >= high_alarm_liters && !high_alarm_active) {
+        ESP_LOGI(TAG, "High fluid level alarm triggered: %.1f liters", volume_liters);
+        high_alarm_active = true;
+    } else if (volume_liters < high_alarm_liters && high_alarm_active) {
+        high_alarm_active = false;
+    }
+}
 
-    httpd_resp_send(req, "Configuration saved. <a href=\"/\">Back</a>", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
+void WebServer::saveCalibrationToNVS(const std::vector<CalibrationPoint>& calibration) {
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("calibration", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for calibration: %d", ret);
+        return;
+    }
+
+    nvs_set_u8(nvs, "num_points", static_cast<uint8_t>(calibration.size()));
+    std::vector<float> blob(calibration.size() * 2);
+    for (size_t i = 0; i < calibration.size() && i < 16; i++) {
+        blob[i * 2] = calibration[i].distance;
+        blob[i * 2 + 1] = calibration[i].percentage;
+    }
+    nvs_set_blob(nvs, "points", blob.data(), blob.size() * sizeof(float));
+    esp_err_t commit_ret = nvs_commit(nvs);
+    if (commit_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Calibration committed to NVS, points: %d", calibration.size());
+    } else {
+        ESP_LOGE(TAG, "Failed to commit calibration to NVS: %d", commit_ret);
+    }
+    nvs_close(nvs);
+}
+
+void WebServer::loadCalibrationFromNVS(std::vector<CalibrationPoint>& calibration) {
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("calibration", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) return;
+
+    uint8_t num_points = 0;
+    nvs_get_u8(nvs, "num_points", &num_points);
+    if (num_points > 16) num_points = 16;
+
+    size_t blob_size = num_points * 2 * sizeof(float);
+    std::vector<float> blob(num_points * 2);
+    ret = nvs_get_blob(nvs, "points", blob.data(), &blob_size);
+    if (ret == ESP_OK && blob_size == num_points * 2 * sizeof(float)) {
+        calibration.clear();
+        for (uint8_t i = 0; i < num_points; i++) {
+            CalibrationPoint point;
+            point.distance = blob[i * 2];
+            point.percentage = blob[i * 2 + 1];
+            calibration.push_back(point);
+        }
+    }
+    nvs_close(nvs);
+}
+
+void WebServer::loadWiFiConfig(std::string& ssid, std::string& password) {
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("wifi_config", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for WiFi config: %d", ret);
+        return;
+    }
+
+    char ssid_buf[33] = {0}, pwd_buf[65] = {0};
+    size_t len = sizeof(ssid_buf);
+    ret = nvs_get_str(nvs, "ssid", ssid_buf, &len);
+    if (ret == ESP_OK) {
+        ssid = ssid_buf;
+        ESP_LOGI(TAG, "Loaded WiFi SSID: %s", ssid.c_str());
+    } else {
+        ESP_LOGW(TAG, "No WiFi SSID found in NVS: %d", ret);
+    }
+    len = sizeof(pwd_buf);
+    ret = nvs_get_str(nvs, "password", pwd_buf, &len);
+    if (ret == ESP_OK) {
+        password = pwd_buf;
+        ESP_LOGI(TAG, "Loaded WiFi password");
+    } else {
+        ESP_LOGW(TAG, "No WiFi password found in NVS: %d", ret);
+    }
+    nvs_close(nvs);
+}
+
+void WebServer::saveSettingsToNVS() {
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("n2k_config", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for settings: %d", ret);
+        return;
+    }
+
+    DeviceSettings_t settings;
+    strncpy(settings.deviceName, getDeviceName().c_str(), sizeof(settings.deviceName) - 1);
+    settings.deviceName[sizeof(settings.deviceName) - 1] = '\0';
+    settings.tankHeight = tank_height;
+    settings.tankVolume = tank_volume;
+    settings.sensorOffset = sensor_offset;
+    settings.lowAlarmPercent = low_alarm_percent;
+    settings.highAlarmPercent = high_alarm_percent;
+    strncpy(settings.tankShape, tank_shape.c_str(), sizeof(settings.tankShape) - 1);
+    settings.tankShape[sizeof(settings.tankShape) - 1] = '\0';
+    strncpy(settings.distUnit, dist_unit.c_str(), sizeof(settings.distUnit) - 1);
+    settings.distUnit[sizeof(settings.distUnit) - 1] = '\0';
+    strncpy(settings.volUnit, vol_unit.c_str(), sizeof(settings.volUnit) - 1);
+    settings.volUnit[sizeof(settings.volUnit) - 1] = '\0';
+    settings.interval = getTransmissionInterval();
+
+    ret = nvs_set_blob(nvs, "settings", &settings, sizeof(DeviceSettings_t));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set settings blob: %d", ret);
+        nvs_close(nvs);
+        return;
+    }
+
+    esp_err_t commit_ret = nvs_commit(nvs);
+    if (commit_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Settings committed to NVS");
+    } else {
+        ESP_LOGE(TAG, "Failed to commit settings to NVS: %d", commit_ret);
+    }
+    nvs_close(nvs);
+}
+
+void WebServer::loadSettingsFromNVS() {
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("n2k_config", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for settings: %d", ret);
+        return;
+    }
+
+    DeviceSettings_t settings;
+    size_t size = sizeof(DeviceSettings_t);
+    ret = nvs_get_blob(nvs, "settings", &settings, &size);
+    if (ret == ESP_OK && size == sizeof(DeviceSettings_t)) {
+        setDeviceName(settings.deviceName);
+        tank_height = settings.tankHeight;
+        tank_volume = settings.tankVolume;
+        sensor_offset = settings.sensorOffset;
+        low_alarm_percent = settings.lowAlarmPercent;
+        high_alarm_percent = settings.highAlarmPercent;
+        tank_shape = settings.tankShape;
+        dist_unit = settings.distUnit;
+        vol_unit = settings.volUnit;
+        setTransmissionInterval(settings.interval);
+        ESP_LOGI(TAG, "Settings loaded from NVS");
+    } else {
+        ESP_LOGW(TAG, "No settings found in NVS or invalid size, using defaults: %d", ret);
+    }
+    nvs_close(nvs);
+}
+
+template<typename T>
+void WebServer::saveToNVM(const char* key, T value) {
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("n2k_config", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for key '%s': %d", key, ret);
+        return;
+    }
+
+    if constexpr (std::is_same<T, uint32_t>::value) {
+        ret = nvs_set_u32(nvs, key, value);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set uint32 '%s' = %u: %d", key, value, ret);
+            nvs_close(nvs);
+            return;
+        }
+        ESP_LOGI(TAG, "Saved uint32 '%s' = %u to NVS", key, value);
+    } else if constexpr (std::is_same<T, std::string>::value) {
+        ret = nvs_set_str(nvs, key, value.c_str());
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set string '%s' = '%s': %d", key, value.c_str(), ret);
+            nvs_close(nvs);
+            return;
+        }
+        ESP_LOGI(TAG, "Saved string '%s' = '%s' to NVS", key, value.c_str());
+    }
+
+    esp_err_t commit_ret = nvs_commit(nvs);
+    if (commit_ret == ESP_OK) {
+        ESP_LOGI(TAG, "NVS commit successful for key '%s'", key);
+    } else {
+        ESP_LOGE(TAG, "Failed to commit NVS for key '%s': %d", key, commit_ret);
+    }
+    nvs_close(nvs);
 }

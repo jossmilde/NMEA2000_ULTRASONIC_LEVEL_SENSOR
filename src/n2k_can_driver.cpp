@@ -20,7 +20,9 @@ N2kCanDriver::N2kCanDriver(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t rs_p
         _device_name = "Ultrasonic Level Sensor";
         _transmission_interval_ms = 1000;
     }
+}
 
+void N2kCanDriver::Init() {
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << _rs_pin);
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -36,7 +38,7 @@ N2kCanDriver::N2kCanDriver(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t rs_p
     g_config.rx_queue_len = 5;
     g_config.alerts_enabled = TWAI_ALERT_NONE;
     g_config.clkout_divider = 0;
-    g_config.intr_flags = ESP_INTR_FLAG_LEVEL1;  // Low priority
+    g_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
     g_config.controller_id = 0;
 
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
@@ -65,7 +67,7 @@ N2kCanDriver::~N2kCanDriver() {
 }
 
 void N2kCanDriver::setDeviceName(const std::string& name) {
-    _device_name = name.substr(0, 31);  // Limit to 31 chars for NVS
+    _device_name = name.substr(0, 31);
     nvs_handle_t nvs;
     if (nvs_open("nmea_config", NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_str(nvs, "device_name", _device_name.c_str());
@@ -79,7 +81,7 @@ std::string N2kCanDriver::getDeviceName() const {
 }
 
 void N2kCanDriver::setTransmissionInterval(uint32_t interval_ms) {
-    _transmission_interval_ms = (interval_ms < 500) ? 500 : (interval_ms > 10000 ? 10000 : interval_ms);  // 0.5s to 10s
+    _transmission_interval_ms = (interval_ms < 500) ? 500 : (interval_ms > 10000 ? 10000 : interval_ms);
     nvs_handle_t nvs;
     if (nvs_open("nmea_config", NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_u32(nvs, "tx_interval", _transmission_interval_ms);

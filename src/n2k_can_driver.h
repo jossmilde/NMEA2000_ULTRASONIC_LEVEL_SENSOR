@@ -12,6 +12,7 @@ public:
                  gpio_num_t rx_pin = GPIO_NUM_26, 
                  gpio_num_t rs_pin = GPIO_NUM_23);
     virtual ~N2kCanDriver();
+    void Init();  // Manual TWAI init
 
     void setDeviceName(const std::string& name);
     std::string getDeviceName() const;
@@ -32,4 +33,4 @@ private:
     uint32_t _transmission_interval_ms;
 };
 
-#endif
+#endif//last known n2k_can_driver.h
