@@ -10,6 +10,7 @@
 #include <esp_netif.h>
 #include <esp_event.h>
 #include <inttypes.h>
+#include <string.h>
 
 static const char* TAG = "Main";
 
@@ -20,7 +21,6 @@ WebServer webServer(&NMEA2000, &sensor);
 const unsigned long DeviceSerial = 123456;
 const unsigned short ProductCode = 2001;
 
-// WiFi event handler
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
@@ -30,6 +30,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 break;
             case WIFI_EVENT_STA_DISCONNECTED:
                 ESP_LOGE(TAG, "WiFi STA disconnected, reason: %d", ((wifi_event_sta_disconnected_t*)event_data)->reason);
+                esp_wifi_connect();  // Attempt reconnect
                 break;
             case WIFI_EVENT_STA_CONNECTED:
                 ESP_LOGI(TAG, "WiFi STA connected");
@@ -67,7 +68,9 @@ void sendFluidLevel() {
         tN2kMsg N2kMsg;
         SetN2kFluidLevel(N2kMsg, 0, N2kft_Water, level_percent / 100.0, webServer.getTankVolumeLiters());
         if (!NMEA2000.SendMsg(N2kMsg)) {
-            ESP_LOGW(TAG, "Failed to send NMEA2000 message");
+            ESP_LOGW(TAG, "Failed to send NMEA2000 message, PGN: %lu", N2kMsg.PGN);
+        } else {
+            ESP_LOGI(TAG, "Sent NMEA2000 message, PGN: %lu", N2kMsg.PGN);
         }
         webServer.checkAndSendAlarms();
         last_sent = now;
@@ -115,15 +118,15 @@ void wifiScanTask(void* pvParameters) {
     int retries = 5;
     while (retries--) {
         wifi_scan_config_t scan_config = {};
-        scan_config.ssid = nullptr;  // Scan all SSIDs
-        scan_config.channel = 6;     // Target Channel 6 (LieMo_Gast)
-        scan_config.scan_time.active.min = 4000;  // Min scan time (4s)
-        scan_config.scan_time.active.max = 6000;  // Max scan time (6s)
-        ESP_LOGI(TAG, "Starting WiFi scan on Channel 6 with min=%" PRIu32 " ms, max=%" PRIu32 " ms", 
+        scan_config.ssid = nullptr;
+        scan_config.channel = 0;
+        scan_config.scan_time.active.min = 120;
+        scan_config.scan_time.active.max = 200;
+        ESP_LOGI(TAG, "Starting WiFi scan on all channels with min=%" PRIu32 " ms, max=%" PRIu32 " ms", 
                  scan_config.scan_time.active.min, scan_config.scan_time.active.max);
         esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "WiFi scan failed on Channel 6 with error %d, retries left: %d", ret, retries);
+            ESP_LOGE(TAG, "WiFi scan failed with error %d, retries left: %d", ret, retries);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
@@ -176,7 +179,6 @@ void webServerTask(void* pvParameters) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Register WiFi event handler
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
@@ -188,18 +190,19 @@ void webServerTask(void* pvParameters) {
         esp_netif_create_default_wifi_sta();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-        // Direct connection to LieMo_Gast on Channel 6
         ESP_LOGI(TAG, "Attempting direct connection to %s on Channel 6", ssid.c_str());
         webServer.connectToWiFi(ssid.c_str(), password.c_str());
 
-        int retries = 40;
+        int retries = 60;
+        bool connected = false;
         while (retries--) {
             wifi_ap_record_t ap_info;
             esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
             if (ret == ESP_OK) {
                 ESP_LOGI(TAG, "Connected to WiFi STA successfully: SSID=%s, RSSI=%d, Channel=%d", 
-                         ap_info.ssid, ap_info.rssi, ap_info.primary);
-                goto start_server;
+                         (char*)ap_info.ssid, ap_info.rssi, ap_info.primary);
+                connected = true;
+                break;
             } else if (ret == ESP_ERR_WIFI_NOT_CONNECT) {
                 ESP_LOGI(TAG, "Still connecting to STA %s, retrying... (%d retries left)", ssid.c_str(), retries);
             } else {
@@ -207,14 +210,19 @@ void webServerTask(void* pvParameters) {
             }
             vTaskDelay(pdMS_TO_TICKS(500));
         }
-        ESP_LOGW(TAG, "Failed to connect to STA %s after 40 retries, falling back to AP mode", ssid.c_str());
-        esp_wifi_stop();
-        esp_wifi_deinit();
-        esp_netif_create_default_wifi_ap();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-        webServer.startWiFiAP();
-        xTaskCreate(wifiScanTask, "wifi_scan_task", 4096, NULL, 4, NULL);
+
+        if (!connected) {
+            ESP_LOGW(TAG, "Failed to connect to STA %s after 60 retries, falling back to AP mode", ssid.c_str());
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            esp_netif_create_default_wifi_ap();
+            ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+            webServer.startWiFiAP();
+            xTaskCreate(wifiScanTask, "wifi_scan_task", 4096, NULL, 4, NULL);
+        } else {
+            goto start_server;
+        }
     } else {
         ESP_LOGI(TAG, "No WiFi credentials in NVM, starting AP mode...");
         esp_netif_create_default_wifi_ap();
@@ -223,7 +231,7 @@ void webServerTask(void* pvParameters) {
     }
 
 start_server:
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(5000));
     webServer.start();
     ESP_LOGI(TAG, "Web server startup completed");
     vTaskDelay(pdMS_TO_TICKS(5000));
@@ -240,7 +248,7 @@ extern "C" void app_main() {
     }
     ESP_LOGI(TAG, "NVS initialized");
 
-    webServer.loadSettingsFromNVS();
+    webServer.loadSettingFromNVS();
 
     std::vector<CalibrationPoint> calibration;
     webServer.loadCalibrationFromNVS(calibration);
@@ -251,7 +259,7 @@ extern "C" void app_main() {
     vTaskDelay(pdMS_TO_TICKS(2000));
     ESP_LOGI(TAG, "Starting tasks...");
     xTaskCreate(webServerTask, "web_server_task", 24576, NULL, 5, NULL);
-    xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 5, NULL);
+    xTaskCreate(nmeaTask, "nmea_task", 8192, NULL, 4, NULL);
     xTaskCreate(simulateUltrasonicTask, "ultrasonic_sim", 4096, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Entering main loop...");
