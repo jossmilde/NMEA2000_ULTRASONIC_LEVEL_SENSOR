@@ -148,9 +148,16 @@ esp_err_t WebServer::rootHandler(httpd_req_t* req) {
 }
 
 esp_err_t WebServer::tankFormHandler(httpd_req_t* req) {
+    std::vector<CalibrationPoint> calibration;
+    loadCalibrationFromNVS(calibration);
+
+    int num_calibration_points = calibration.size();
+    if (num_calibration_points < 3) num_calibration_points = 3;
+    if (num_calibration_points > 8) num_calibration_points = 8;
+
     std::string resp = "<html><body><h1>Tank Settings</h1>";
     resp += "<form id='tankForm' onsubmit='save(event, \"tank\")'>";
-    resp += "Height: <input type='text' name='tank_height' value='" + formatNumber(convertDistance(tank_height, "cm", dist_unit)) + "' id='tank_height'><br>";
+    resp += "Height: <input type='text' name='tank_height' value='" + formatNumber(convertDistance(tank_height, "cm", dist_unit)) + "' id='tank_height' onchange='updateCalibrationPoints()'><br>";
     resp += "Offset: <input type='text' name='sensor_offset' value='" + formatNumber(convertDistance(sensor_offset, "cm", dist_unit)) + "' id='sensor_offset'><br>";
     resp += "Distance Unit: <select name='dist_unit' id='dist_unit' onchange='updateUnits(this.value)'>";
     for (const char* unit : {"mm", "cm", "m", "inches", "ft"}) {
@@ -165,11 +172,40 @@ esp_err_t WebServer::tankFormHandler(httpd_req_t* req) {
     resp += "</select><br>";
     resp += "Low Alarm (%): <input type='text' name='low_alarm_percent' value='" + formatNumber(low_alarm_percent) + "'>%<br>";
     resp += "High Alarm (%): <input type='text' name='high_alarm_percent' value='" + formatNumber(high_alarm_percent) + "'>%<br>";
-    resp += "Shape: <select name='tank_shape'>";
+    resp += "Shape: <select name='tank_shape' id='tank_shape' onchange='toggleCalibrationPoints(this.value)'>";
     for (const char* shape : {"rectangular", "cylindrical standing", "cylindrical laying flat", "custom"}) {
         resp += "<option value='" + std::string(shape) + "' " + (tank_shape == shape ? "selected" : "") + ">" + shape + "</option>";
     }
     resp += "</select><br>";
+
+    // Add dropdown for number of calibration points
+    resp += "<div id='calibration_settings' style='display:none'>";
+    resp += "Number of Calibration Points: <select name='num_calibration_points' id='num_calibration_points' onchange='updateCalibrationPoints()'>";
+    for (int i = 3; i <= 8; i++) {
+        resp += "<option value='" + std::to_string(i) + "' " + (i == num_calibration_points ? "selected" : "") + ">" + std::to_string(i) + "</option>";
+    }
+    resp += "</select><br>";
+
+    // Add fields for up to 8 calibration points
+    for (int i = 0; i < 8; i++) {
+        resp += "<div id='calibration_point_" + std::to_string(i) + "' style='display:" + (i < num_calibration_points ? "block" : "none") + "'>";
+        resp += "Calibration Point " + std::to_string(i + 1) + ":<br>";
+        if (i == 0) {
+            resp += "Distance: <input type='text' name='calibration_distance_" + std::to_string(i) + "' value='0' disabled><br>";
+            resp += "Percentage: <input type='text' name='calibration_percentage_" + std::to_string(i) + "' value='100' disabled><br>";
+        } else if (i == num_calibration_points - 1) {
+            resp += "Distance: <input type='text' name='calibration_distance_" + std::to_string(i) + "' value='" + formatNumber(tank_height) + "' id='last_calibration_distance' disabled><br>";
+            resp += "Percentage: <input type='text' name='calibration_percentage_" + std::to_string(i) + "' value='0' disabled><br>";
+        } else {
+            float distance = (i < calibration.size()) ? calibration[i].distance : (tank_height / (num_calibration_points - 1)) * i;
+            float percentage = (i < calibration.size()) ? calibration[i].percentage : 100.0 - (100.0 / (num_calibration_points - 1)) * i;
+            resp += "Distance: <input type='text' name='calibration_distance_" + std::to_string(i) + "' value='" + formatNumber(distance) + "'><br>";
+            resp += "Percentage: <input type='text' name='calibration_percentage_" + std::to_string(i) + "' value='" + formatNumber(percentage) + "'><br>";
+        }
+        resp += "</div>";
+    }
+    resp += "</div>";
+
     resp += "<input type='submit' value='Save'></form>";
     resp += "<script>";
     resp += "function updateUnits(newUnit){";
@@ -181,6 +217,35 @@ esp_err_t WebServer::tankFormHandler(httpd_req_t* req) {
     resp += "  var v=document.getElementById('tank_volume'), liter=" + std::to_string(tank_volume) + ";";
     resp += "  v.value=(newUnit=='m³'?liter/1000:(newUnit=='gallon'?liter/3.78541:(newUnit=='imperial gallon'?liter/4.54609:liter))).toFixed(1);";
     resp += "}";
+    resp += "function toggleCalibrationPoints(shape){";
+    resp += "  var display = (shape == 'custom') ? 'block' : 'none';";
+    resp += "  document.getElementById('calibration_settings').style.display = display;";
+    resp += "  updateCalibrationPoints();";
+    resp += "}";
+    resp += "function updateCalibrationPoints(){";
+    resp += "  var numPoints = document.getElementById('num_calibration_points').value;";
+    resp += "  var tankHeight = parseFloat(document.getElementById('tank_height').value);";
+    resp += "  for (var i = 0; i < 8; i++) {";
+    resp += "    var pointDiv = document.getElementById('calibration_point_' + i);";
+    resp += "    if (i < numPoints) {";
+    resp += "      pointDiv.style.display = 'block';";
+    resp += "      if (i == 0) {";
+    resp += "        document.getElementById('calibration_distance_' + i).value = '0';";
+    resp += "        document.getElementById('calibration_percentage_' + i).value = '100';";
+    resp += "      } else if (i == numPoints - 1) {";
+    resp += "        document.getElementById('calibration_distance_' + i).value = tankHeight;";
+    resp += "        document.getElementById('calibration_percentage_' + i).value = '0';";
+    resp += "      } else {";
+    resp += "        var distance = (tankHeight / (numPoints - 1)) * i;";
+    resp += "        var percentage = 100.0 - (100.0 / (numPoints - 1)) * i;";
+    resp += "        document.getElementById('calibration_distance_' + i).value = distance.toFixed(1);";
+    resp += "        document.getElementById('calibration_percentage_' + i).value = percentage.toFixed(1);";
+    resp += "      }";
+    resp += "    } else {";
+    resp += "      pointDiv.style.display = 'none';";
+    resp += "    }";
+    resp += "  }";
+    resp += "}";
     resp += "async function save(e,endpoint){";
     resp += "  e.preventDefault();";
     resp += "  const form=new FormData(e.target);";
@@ -190,14 +255,14 @@ esp_err_t WebServer::tankFormHandler(httpd_req_t* req) {
     resp += "  form.set('dist_unit', document.getElementById('dist_unit').value);";
     resp += "  form.set('vol_unit', document.getElementById('vol_unit').value);";
     resp += "  await fetch('/'+endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(form).toString()});";
-    resp += "  window.opener.showStatus();window.close();}";
+    resp += "  window.opener.showStatus();window.opener.location.reload();window.close();}";
+    resp += "window.onload = function() { toggleCalibrationPoints(document.getElementById('tank_shape').value); updateCalibrationPoints(); };";
     resp += "</script>";
     resp += "</body></html>";
 
     httpd_resp_send(req, resp.c_str(), resp.length());
     return ESP_OK;
 }
-
 esp_err_t WebServer::tankHandler(httpd_req_t* req) {
     char buf[2048];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -222,6 +287,7 @@ esp_err_t WebServer::tankHandler(httpd_req_t* req) {
     std::string tank_shape_new = tank_shape;
     std::string dist_unit_new = dist_unit;
     std::string vol_unit_new = vol_unit;
+    int num_calibration_points = 3;
 
     if (httpd_query_key_value(buf, "dist_unit", param, sizeof(param)) == ESP_OK) {
         dist_unit_new = param;
@@ -251,6 +317,25 @@ esp_err_t WebServer::tankHandler(httpd_req_t* req) {
     if (httpd_query_key_value(buf, "tank_shape", param, sizeof(param)) == ESP_OK) {
         tank_shape_new = param;
     }
+    if (httpd_query_key_value(buf, "num_calibration_points", param, sizeof(param)) == ESP_OK) {
+        num_calibration_points = std::stoi(param);
+        if (num_calibration_points < 3) num_calibration_points = 3;
+        if (num_calibration_points > 8) num_calibration_points = 8;
+    }
+
+    // Handle calibration points
+    std::vector<CalibrationPoint> calibration;
+    for (int i = 0; i < num_calibration_points; i++) {
+        std::string distance_key = "calibration_distance_" + std::to_string(i);
+        std::string percentage_key = "calibration_percentage_" + std::to_string(i);
+        if (httpd_query_key_value(buf, distance_key.c_str(), param, sizeof(param)) == ESP_OK) {
+            float distance = parseFloat(param, 0.0);
+            if (httpd_query_key_value(buf, percentage_key.c_str(), param, sizeof(param)) == ESP_OK) {
+                float percentage = parseFloat(param, 0.0);
+                calibration.push_back({distance, percentage});
+            }
+        }
+    }
 
     tank_height = tank_height_new;
     tank_volume = tank_volume_new;
@@ -260,6 +345,10 @@ esp_err_t WebServer::tankHandler(httpd_req_t* req) {
     tank_shape = tank_shape_new;
     dist_unit = dist_unit_new;
     vol_unit = vol_unit_new;
+
+    // Save calibration points to NVS
+    saveCalibrationToNVS(calibration);
+
     saveSettingsToNVS();
 
     ESP_LOGI(TAG, "Tank settings saved successfully");
@@ -573,7 +662,7 @@ float WebServer::getLevelPercentage() {
         float h = distance / height;
         float volume_percent = std::acos(1 - 2 * h) / M_PI + (2 * h - 1) * std::sqrt(2 * h - h * h) / M_PI;
         return 100.0 * (1.0 - volume_percent);
-    } else {
+    } else if (tank_shape == "custom") {
         std::vector<CalibrationPoint> calibration;
         loadCalibrationFromNVS(calibration);
         if (calibration.empty()) return 0.0;
@@ -650,13 +739,18 @@ void WebServer::saveCalibrationToNVS(const std::vector<CalibrationPoint>& calibr
         return;
     }
 
+    // Save the number of calibration points
     nvs_set_u8(nvs, "num_points", static_cast<uint8_t>(calibration.size()));
+
+    // Save the calibration points as a blob
     std::vector<float> blob(calibration.size() * 2);
-    for (size_t i = 0; i < calibration.size() && i < 16; i++) {
+    for (size_t i = 0; i < calibration.size(); i++) {
         blob[i * 2] = calibration[i].distance;
         blob[i * 2 + 1] = calibration[i].percentage;
     }
     nvs_set_blob(nvs, "points", blob.data(), blob.size() * sizeof(float));
+
+    // Commit the changes
     esp_err_t commit_ret = nvs_commit(nvs);
     if (commit_ret == ESP_OK) {
         ESP_LOGI(TAG, "Calibration committed to NVS, points: %d", calibration.size());
@@ -669,12 +763,21 @@ void WebServer::saveCalibrationToNVS(const std::vector<CalibrationPoint>& calibr
 void WebServer::loadCalibrationFromNVS(std::vector<CalibrationPoint>& calibration) {
     nvs_handle_t nvs;
     esp_err_t ret = nvs_open("calibration", NVS_READWRITE, &nvs);
-    if (ret != ESP_OK) return;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for calibration: %d", ret);
+        return;
+    }
 
+    // Get the number of calibration points
     uint8_t num_points = 0;
-    nvs_get_u8(nvs, "num_points", &num_points);
-    if (num_points > 16) num_points = 16;
+    ret = nvs_get_u8(nvs, "num_points", &num_points);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get number of calibration points: %d", ret);
+        nvs_close(nvs);
+        return;
+    }
 
+    // Load the calibration points as a blob
     size_t blob_size = num_points * 2 * sizeof(float);
     std::vector<float> blob(num_points * 2);
     ret = nvs_get_blob(nvs, "points", blob.data(), &blob_size);
@@ -686,6 +789,9 @@ void WebServer::loadCalibrationFromNVS(std::vector<CalibrationPoint>& calibratio
             point.percentage = blob[i * 2 + 1];
             calibration.push_back(point);
         }
+        ESP_LOGI(TAG, "Loaded %d calibration points from NVS", num_points);
+    } else {
+        ESP_LOGE(TAG, "Failed to load calibration points from NVS: %d", ret);
     }
     nvs_close(nvs);
 }

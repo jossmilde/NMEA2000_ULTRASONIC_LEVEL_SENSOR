@@ -1,9 +1,11 @@
 #ifndef CALIBRATION_H
 #define CALIBRATION_H
 
+#include <vector>
+
 struct CalibrationPoint {
     float distance;
     float percentage;
 };
 
-#endif
+#endif // CALIBRATION_H
