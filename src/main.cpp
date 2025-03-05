@@ -1,3 +1,5 @@
+#include <algorithm> // For std::find_if
+#include <vector>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "n2k_can_driver.h"
@@ -18,7 +20,7 @@ N2kCanDriver NMEA2000(GPIO_NUM_27, GPIO_NUM_26, GPIO_NUM_23);
 Ultrasonic sensor;
 WebServer webServer(&NMEA2000, &sensor);
 
-const unsigned long DeviceSerial = 123456;
+const unsigned long DeviceSerial = 123457;
 const unsigned short ProductCode = 2001;
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -45,6 +47,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+void Handle127505(const tN2kMsg &N2kMsg) {
+    uint8_t instance;
+    tN2kFluidType fluidType;
+    double level;
+    double capacity;
+
+    if (ParseN2kFluidLevel(N2kMsg, instance, fluidType, level, capacity)) {
+        ESP_LOGI("NMEA2000", "PGN 127505: Instance=%d, FluidType=%d, Level=%.2f%%, Capacity=%.2f liters",
+                 instance, fluidType, level * 100, capacity);
+    } else {
+        ESP_LOGW("NMEA2000", "Failed to parse PGN 127505");
+    }
+}
+
 void setupNMEA2000() {
     ESP_LOGI(TAG, "Setting up NMEA2000...");
     NMEA2000.SetProductInformation("00000001", ProductCode, NMEA2000.getDeviceName().c_str(), "1.00", "0.1");
@@ -52,7 +68,9 @@ void setupNMEA2000() {
     NMEA2000.SetMode(tNMEA2000::N2km_NodeOnly);
     NMEA2000.EnableForward(false);
     NMEA2000.SetMsgHandler([](const tN2kMsg& msg) {
-        ESP_LOGI(TAG, "Received PGN: %lu", msg.PGN);
+        if (msg.PGN == 127505) {
+            Handle127505(msg);
+        }
     });
     NMEA2000.Init();
     ESP_LOGI(TAG, "NMEA2000 initialized");
@@ -80,8 +98,8 @@ void sendFluidLevel() {
 void nmeaTask(void* pvParameters) {
     ESP_LOGI(TAG, "NMEA task started");
     setupNMEA2000();
+
     while (1) {
-        sendFluidLevel();
         NMEA2000.ParseMessages();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
